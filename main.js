@@ -372,12 +372,12 @@ class EqualPerfectSynth {
 
         // Recording
         const recordBtn = document.getElementById('recordBtn');
-        recordBtn.addEventListener('click', () => {
+        recordBtn.addEventListener('click', async () => {
             if (this.audioEngine.isRecording) {
-                this.audioEngine.stopRecording();
-                this.audioEngine.downloadRecording();
                 recordBtn.classList.remove('active');
                 recordBtn.textContent = '● REC';
+                await this.audioEngine.stopRecording();
+                this.audioEngine.downloadRecording();
             } else {
                 this.audioEngine.startRecording();
                 recordBtn.classList.add('active');

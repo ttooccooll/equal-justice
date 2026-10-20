@@ -16,6 +16,8 @@ export class AudioEngine {
         this.lfo = null;
         this.lfoGain = null;
         this.voices = new Map();
+        // Voices fading out after note-off; kept apart so the same key can be played again right away
+        this.releasingVoices = new Set();
         
         this.params = {
             waveform: 'sawtooth',
@@ -37,6 +39,7 @@ export class AudioEngine {
 
         this.isRecording = false;
         this.mediaRecorder = null;
+        this.recordingDestination = null;
         this.recordedChunks = [];
     }
 
@@ -196,6 +199,9 @@ export class AudioEngine {
         if (!this.voices.has(midiNote)) return;
 
         const voice = this.voices.get(midiNote);
+        this.voices.delete(midiNote);
+        this.releasingVoices.add(voice);
+
         const now = this.audioContext.currentTime;
         const release = Math.max(this.params.release, MIN_ENVELOPE_TIME);
 
@@ -204,14 +210,11 @@ export class AudioEngine {
         voice.gain.gain.linearRampToValueAtTime(0, now + release);
 
         setTimeout(() => {
-            if (this.voices.has(midiNote)) {
-                const v = this.voices.get(midiNote);
-                v.oscillator.stop();
-                v.oscillator.disconnect();
-                v.gain.disconnect();
-                this.voices.delete(midiNote);
-                this.updateVoiceBusGain();
-            }
+            voice.oscillator.stop();
+            voice.oscillator.disconnect();
+            voice.gain.disconnect();
+            this.releasingVoices.delete(voice);
+            this.updateVoiceBusGain();
         }, release * 1000 + 100);
 
         this.tuningSystem.removeNote(midiNote);
@@ -221,7 +224,7 @@ export class AudioEngine {
      * Scale the voice bus by 1/sqrt(voices) so a chord is about as loud as a single note
      */
     updateVoiceBusGain() {
-        const count = Math.max(1, this.voices.size);
+        const count = Math.max(1, this.voices.size + this.releasingVoices.size);
         this.voiceBus.gain.setTargetAtTime(1 / Math.sqrt(count), this.audioContext.currentTime, 0.005);
     }
 
@@ -285,7 +288,7 @@ export class AudioEngine {
         this.params.waveform = waveform;
         
         // Update existing voices
-        for (const voice of this.voices.values()) {
+        for (const voice of [...this.voices.values(), ...this.releasingVoices]) {
             voice.oscillator.type = waveform;
         }
     }
@@ -400,10 +403,10 @@ export class AudioEngine {
         if (this.isRecording || !this.audioContext) return;
         
         this.recordedChunks = [];
-        const dest = this.audioContext.createMediaStreamDestination();
-        this.clipper.connect(dest);
-        
-        this.mediaRecorder = new MediaRecorder(dest.stream);
+        this.recordingDestination = this.audioContext.createMediaStreamDestination();
+        this.clipper.connect(this.recordingDestination);
+
+        this.mediaRecorder = new MediaRecorder(this.recordingDestination.stream);
         this.mediaRecorder.ondataavailable = (e) => {
             if (e.data.size > 0) this.recordedChunks.push(e.data);
         };
@@ -411,11 +414,21 @@ export class AudioEngine {
         this.isRecording = true;
     }
 
+    /**
+     * Stop recording; resolves once the recorder has handed over its data and it is ready to download
+     */
     stopRecording() {
-        if (!this.isRecording || !this.mediaRecorder) return;
-        
-        this.mediaRecorder.stop();
+        if (!this.isRecording || !this.mediaRecorder) return Promise.resolve();
+
         this.isRecording = false;
+        return new Promise((resolve) => {
+            // The final chunk arrives asynchronously, just before 'stop' fires
+            this.mediaRecorder.onstop = () => {
+                this.clipper.disconnect(this.recordingDestination);
+                resolve();
+            };
+            this.mediaRecorder.stop();
+        });
     }
 
     downloadRecording() {
