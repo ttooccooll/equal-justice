@@ -1,8 +1,14 @@
+// Shortest attack/release ramp; anything faster than this clicks
+const MIN_ENVELOPE_TIME = 0.005;
+
 export class AudioEngine {
     constructor(tuningSystem) {
         this.tuningSystem = tuningSystem;
         this.audioContext = null;
+        this.voiceBus = null;
         this.masterGain = null;
+        this.limiter = null;
+        this.clipper = null;
         this.filter = null;
         this.delay = null;
         this.reverb = null;
@@ -38,7 +44,10 @@ export class AudioEngine {
         if (this.audioContext) return;
 
         this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        
+
+        // All voices sum here; its gain drops as notes are added so chords don't overload
+        this.voiceBus = this.audioContext.createGain();
+
         this.filter = this.audioContext.createBiquadFilter();
         this.filter.type = this.params.filterType;
         this.filter.frequency.value = this.params.filterFreq;
@@ -59,6 +68,9 @@ export class AudioEngine {
 
         this.analyser = this.audioContext.createAnalyser();
         this.analyser.fftSize = 2048;
+        // Default ceiling of -30dB pins loud bins at the top of the visualizer
+        this.analyser.minDecibels = -100;
+        this.analyser.maxDecibels = 0;
 
         this.lfo = this.audioContext.createOscillator();
         this.lfo.type = 'sine';
@@ -70,6 +82,24 @@ export class AudioEngine {
 
         this.masterGain = this.audioContext.createGain();
         this.masterGain.gain.value = this.params.volume;
+
+        // Limiter holds loud passages (high volume, resonance, effects) just under full scale
+        this.limiter = this.audioContext.createDynamicsCompressor();
+        this.limiter.threshold.value = -3;
+        this.limiter.knee.value = 0;
+        this.limiter.ratio.value = 20;
+        this.limiter.attack.value = 0.001;
+        this.limiter.release.value = 0.1;
+
+        // Soft clipper catches the transients the limiter is too slow for.
+        // Input is halved so the curve spans ±2 instead of hard-clamping at ±1
+        this.clipperDrive = this.audioContext.createGain();
+        this.clipperDrive.gain.value = 0.5;
+        this.clipper = this.audioContext.createWaveShaper();
+        this.clipper.curve = this.createSoftClipCurve();
+
+        // Voices: voiceBus -> filter
+        this.voiceBus.connect(this.filter);
 
         // Main signal path: filter -> masterGain (dry signal)
         this.filter.connect(this.masterGain);
@@ -89,8 +119,11 @@ export class AudioEngine {
         // Analyser for visualization
         this.filter.connect(this.analyser);
         
-        // Output
-        this.masterGain.connect(this.audioContext.destination);
+        // Output: masterGain -> limiter -> clipper -> destination
+        this.masterGain.connect(this.limiter);
+        this.limiter.connect(this.clipperDrive);
+        this.clipperDrive.connect(this.clipper);
+        this.clipper.connect(this.audioContext.destination);
 
         this.tuningSystem.addListener((tuningInfo, updates) => {
             this.handleTuningUpdate(updates);
@@ -114,6 +147,24 @@ export class AudioEngine {
     }
 
     /**
+     * Clipper curve over inputs -2..2: unity up to 0.9, then eases toward ±1 so output never exceeds full scale
+     */
+    createSoftClipCurve() {
+        const samples = 4097;
+        const knee = 0.9;
+        const curve = new Float32Array(samples);
+        for (let i = 0; i < samples; i++) {
+            const x = (i / (samples - 1)) * 4 - 2;
+            const magnitude = Math.abs(x);
+            const shaped = magnitude <= knee
+                ? magnitude
+                : knee + (1 - knee) * Math.tanh((magnitude - knee) / (1 - knee));
+            curve[i] = Math.sign(x) * shaped;
+        }
+        return curve;
+    }
+
+    /**
      * Play a note
      */
     async playNote(midiNote) {
@@ -132,11 +183,13 @@ export class AudioEngine {
         // Create voice
         const voice = this.createVoice(frequency);
         this.voices.set(midiNote, voice);
+        this.updateVoiceBusGain();
 
         // Apply attack envelope
         const now = this.audioContext.currentTime;
+        const attack = Math.max(this.params.attack, MIN_ENVELOPE_TIME);
         voice.gain.gain.setValueAtTime(0, now);
-        voice.gain.gain.linearRampToValueAtTime(1, now + this.params.attack);
+        voice.gain.gain.linearRampToValueAtTime(1, now + attack);
     }
 
     stopNote(midiNote) {
@@ -144,10 +197,11 @@ export class AudioEngine {
 
         const voice = this.voices.get(midiNote);
         const now = this.audioContext.currentTime;
+        const release = Math.max(this.params.release, MIN_ENVELOPE_TIME);
 
         voice.gain.gain.cancelScheduledValues(now);
         voice.gain.gain.setValueAtTime(voice.gain.gain.value, now);
-        voice.gain.gain.linearRampToValueAtTime(0, now + this.params.release);
+        voice.gain.gain.linearRampToValueAtTime(0, now + release);
 
         setTimeout(() => {
             if (this.voices.has(midiNote)) {
@@ -156,10 +210,19 @@ export class AudioEngine {
                 v.oscillator.disconnect();
                 v.gain.disconnect();
                 this.voices.delete(midiNote);
+                this.updateVoiceBusGain();
             }
-        }, this.params.release * 1000 + 100);
+        }, release * 1000 + 100);
 
         this.tuningSystem.removeNote(midiNote);
+    }
+
+    /**
+     * Scale the voice bus by 1/sqrt(voices) so a chord is about as loud as a single note
+     */
+    updateVoiceBusGain() {
+        const count = Math.max(1, this.voices.size);
+        this.voiceBus.gain.setTargetAtTime(1 / Math.sqrt(count), this.audioContext.currentTime, 0.005);
     }
 
     createVoice(frequency) {
@@ -174,7 +237,7 @@ export class AudioEngine {
         }
         
         oscillator.connect(gain);
-        gain.connect(this.filter);
+        gain.connect(this.voiceBus);
         
         oscillator.start();
 
@@ -338,7 +401,7 @@ export class AudioEngine {
         
         this.recordedChunks = [];
         const dest = this.audioContext.createMediaStreamDestination();
-        this.masterGain.connect(dest);
+        this.clipper.connect(dest);
         
         this.mediaRecorder = new MediaRecorder(dest.stream);
         this.mediaRecorder.ondataavailable = (e) => {
